@@ -3,7 +3,7 @@
 
 mod usb_jboot;
 
-use defmt::info;
+use defmt::{info, unwrap};
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_stm32::peripherals::USB_OTG_FS;
@@ -30,22 +30,27 @@ async fn main(_spawner: Spawner) {
     {
         use embassy_stm32::rcc::*;
         config.rcc.hse = Some(Hse {
-            freq: Hertz(8_000_000),
-            mode: HseMode::Bypass,
+            freq: Hertz(12_000_000),
+            mode: HseMode::Oscillator,
         });
         config.rcc.pll_src = PllSource::HSE;
         config.rcc.pll = Some(Pll {
-            prediv: PllPreDiv::DIV4,
-            mul: PllMul::MUL168,
-            divp: Some(PllPDiv::DIV2), // 8mhz / 4 * 168 / 2 = 168Mhz.
-            divq: Some(PllQDiv::DIV7), // 8mhz / 4 * 168 / 7 = 48Mhz.
+            // 12 MHz clock source / 12 = 1 MHz PLL input
+            prediv: unwrap!(PllPreDiv::try_from(12)),
+            // 1 MHz PLL input * 240 = 240 MHz PLL VCO
+            mul: unwrap!(PllMul::try_from(240)),
+            // 240 MHz PLL VCO / 2 = 120 MHz main PLL output
+            divp: Some(PllPDiv::DIV2),
+            // 240 MHz PLL VCO / 5 = 48 MHz PLL48 output
+            divq: Some(PllQDiv::DIV5),
             divr: None,
         });
-        config.rcc.ahb_pre = AHBPrescaler::DIV1;
-        config.rcc.apb1_pre = APBPrescaler::DIV4;
-        config.rcc.apb2_pre = APBPrescaler::DIV2;
+        // System clock comes from PLL (= the 120 MHz main PLL output)
         config.rcc.sys = Sysclk::PLL1_P;
-        config.rcc.mux.clk48sel = mux::Clk48sel::PLL1_Q;
+        // 120 MHz / 4 = 30 MHz APB1 frequency
+        config.rcc.apb1_pre = APBPrescaler::DIV4;
+        // 120 MHz / 2 = 60 MHz APB2 frequency
+        config.rcc.apb2_pre = APBPrescaler::DIV2;
     }
     let p = embassy_stm32::init(config);
 
@@ -110,5 +115,3 @@ async fn main(_spawner: Spawner) {
     // If we had made everything `'static` above instead, we could do this using separate tasks instead.
     join(usb_fut, jboot.run()).await;
 }
-
-
