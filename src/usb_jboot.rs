@@ -1,44 +1,164 @@
-use embassy_usb::driver::{Driver, Endpoint, EndpointIn, EndpointOut};
+// use embassy_usb::driver::Driver;
 use defmt::*;
+use embassy_futures::join::join;
+use embassy_stm32::{bind_interrupts, peripherals, usb};
+use embassy_stm32::flash::{Blocking, Flash};
+use embassy_stm32::peripherals::USB_OTG_FS;
+use embassy_stm32::usb::Driver;
 use embassy_time::Timer;
+use embassy_usb::{Builder, UsbDevice};
 use static_cell::StaticCell;
+use crate::bulk_usb::BulkClass;
 
-pub struct JBoot<'a, D: Driver<'a>> {
-    read_ep: D::EndpointOut,
-    write_ep: D::EndpointIn,
+bind_interrupts!(struct Irqs {
+    OTG_FS => usb::InterruptHandler<peripherals::USB_OTG_FS>;
+});
+
+
+pub struct JBoot<'a> {
+    usb: UsbDevice<'a, Driver<'a, USB_OTG_FS>>,
+    inner: JBootInner<'a>,
+}
+
+pub struct JBootInner<'a> {
+    bulk: BulkClass<'a, Driver<'a, USB_OTG_FS>>,
     big_buf: &'static StaticCell<[u8; 0x500]>,
+    // p: &'a embassy_stm32::Peripherals,
+    // flash: Flash<'a>,
+}
+
+pub struct HwContext<'a> {
+    pub flash: Flash<'a>,
 }
 
 
-impl<'a, D> JBoot<'a, D>
-where
-    D: Driver<'a>,
+impl<'a> JBoot<'a>
 {
-    pub fn new(read_ep: D::EndpointOut, write_ep: D::EndpointIn, big_buf: &'static StaticCell<[u8; 1280]>) -> Self {
+    pub fn new(big_buf: &'static StaticCell<[u8; 1280]>,
+                p: embassy_stm32::Peripherals) -> Self {
+        // Create the driver, from the HAL.
+        let mut config = embassy_stm32::usb::Config::default();
+
+        // embassy usb needs some buffers for building the descriptors and receiving data
+        static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+        static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+        static EP_OUT_BUFFER: StaticCell<[u8; 256]> = StaticCell::new();
+
+        // Do not enable vbus_detection. This is a safe default that works in all boards.
+        // However, if your USB device is self-powered (can stay powered on if USB is unplugged), you need
+        // to enable vbus_detection to comply with the USB spec. If you enable it, the board
+        // has to support it or USB won't work at all. See docs on `vbus_detection` for details.
+        config.vbus_detection = false;
+
+        let ep_out_buffer: &'static mut [u8; 256] = EP_OUT_BUFFER.init([0; 256]);
+        let driver = usb::Driver::new_fs(p.USB_OTG_FS, Irqs, p.PA12, p.PA11, ep_out_buffer, config);
+
+        // Create embassy-usb Config
+        let mut config = embassy_usb::Config::new(0x1366, 0x0101);
+        config.manufacturer = Some("SEGGER");
+        config.product = Some("J-Link OpenBoot");
+        config.serial_number = Some("000000123456");
+        config.max_power = 100;
+        config.max_packet_size_0 = 64;
+
+        config.device_class = 0x0;
+        config.device_sub_class = 0x0;
+        config.device_protocol = 0x0;
+
+        // let mut config_descriptor = [0; 256];
+        // let mut control_buf = [0; 64];
+        let config_descriptor = CONFIG_DESCRIPTOR.init([0; 256]);
+        let control_buf = CONTROL_BUF.init([0; 64]);
+
+        // Create embassy-usb DeviceBuilder using the driver and config.
+        let mut builder = Builder::new(
+            driver,
+            config,
+            config_descriptor,
+            &mut [], // embassy-rs PR pending to support zero length BOS descriptor
+            &mut [],
+            control_buf,
+        );
+
+        let bulk = BulkClass::new(&mut builder, 64);
+
+        // Build the builder.
+        let usb = builder.build();
+        // let usb_fut = usb.run();
+
+        // Run the USB device.
+        // let usb_fut = usb.run();
+
         Self {
-            read_ep,
-            write_ep,
-            big_buf,
+            usb,
+            inner: JBootInner { bulk, big_buf },
         }
     }
 
     pub async fn run(&mut self) {
+        let usb_fut = self.usb.run();
+
+        let bulk_fut = async {
+            loop {
+                self.inner.wait_and_handle().await;
+            }
+        };
+
+        join(usb_fut, bulk_fut).await;
+    }
+}
+
+impl<'a> JBootInner<'a>
+{
+    async fn wait_and_handle(&mut self) {
+
         let mut buf = [0u8; 64];
 
-        loop {
-            self.read_ep.wait_enabled().await;
-            // info!("Connected");
+        self.bulk.wait_connection().await;
+        // info!("Connected");
 
-            // Read data from the Bulk OUT endpoint
-            match self.read_ep.read(&mut buf).await {
-                Ok(received_len) => {
-                    self.process_data(&buf[..received_len]).await;
+        // Read data from the Bulk OUT endpoint
+        match self.bulk.read_packet(&mut buf).await {
+            Ok(received_len) => {
+                self.process_data(&buf[..received_len]).await;
+            }
+            Err(_) => {
+                // Handle errors here, maybe reset or log
+                warn!("Error reading from Bulk OUT endpoint");
+            }
+        }
+    }
+
+    async fn process_data(&mut self, data: &[u8]) {
+        // Following commands are supported by the original V9 bootloader:
+        // - cmd_01_version
+        // - cmd_04_get_info
+        // - cmd_05_set_speed
+        // - cmd_06_update_firmware
+        // - cmd_e6_read_config_bf00
+        // - cmd_ed_get_caps_ex
+        // - cmd_f0_get_hw_version
+        // - cmd_fe_read_emu_mem
+
+        let count = data.len();
+        if count == 1 {
+            match data[0] {
+                0x01 => {
+                    self.cmd_01_version().await;
                 }
-                Err(_) => {
-                    // Handle errors here, maybe reset or log
-                    warn!("Error reading from Bulk OUT endpoint");
+                0x04 => {
+                    self.cmd_04_get_info().await;
+                }
+                0x06 => {
+                    self.cmd_06_update_firmware().await;
+                }
+                _ => {
+                    warn!("Unknown command 0x{:02x}", data[0]);
+                    //self.bulk.write_packet(&[0xFF]).await.ok();
                 }
             }
+        } else {
+            warn!("Got unknown data with len: {} bytes", count);
         }
     }
 
@@ -54,13 +174,13 @@ where
             0x6F, 0x6D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 ];
         // first send the length of the response as 2-byte little endian
-        self.write_ep.write(&[response.len() as u8, (response.len() >> 8) as u8]).await.ok();
+        self.bulk.write_packet(&[response.len() as u8, (response.len() >> 8) as u8]).await.ok();
 
         // then send response data in chunks of 64 bytes, including the last chunk even if it's not full
         for chunk in response.chunks(64) {
             info!("Sending chunk of {} bytes", chunk.len());
             // check for error, after sending the chunk
-            match self.write_ep.write(chunk).await {
+            match self.bulk.write_packet(chunk).await {
                 Ok(_) => {},
                 Err(_) => {
                     info!("Error sending chunk");
@@ -73,17 +193,17 @@ where
     async fn cmd_04_get_info(&mut self) {
         info!("Command 0x04: get info");
         // send response: single 0x00 byte
-        self.write_ep.write(&[0x00]).await.ok();
+        self.bulk.write_packet(&[0x00]).await.ok();
     }
 
     async fn cmd_06_update_firmware(&mut self) {
         info!("Command 0x06: update firmware");
         // send response: single 0x00 byte
-        self.write_ep.write(&[0x00]).await.ok();
+        self.bulk.write_packet(&[0x00]).await.ok();
 
         // read 2 bytes: length
         let mut len_buf_1 = [0; 2];
-        self.read_ep.read(&mut len_buf_1).await.ok();
+        self.bulk.read_packet(&mut len_buf_1).await.ok();
 
         // interpret 2 bytes as uint16_t
         let len = u16::from_le_bytes(len_buf_1);
@@ -91,7 +211,7 @@ where
         info!("len: 0x{:x}", len);
         if len > 0x8000 {
             let mut len_buf_2 = [0; 2];
-            self.read_ep.read(&mut len_buf_2).await.ok();
+            self.bulk.read_packet(&mut len_buf_2).await.ok();
             let len2 = u16::from_le_bytes(len_buf_2);
             info!("len2: 0x{:x}", len2);
             let len4 = u32::from_le_bytes([len_buf_1[0], len_buf_1[1], len_buf_2[0], len_buf_2[1]]);
@@ -107,7 +227,7 @@ where
         while offset < len_to_read {
             let chunk_len = core::cmp::min(64, (len_to_read - offset) as usize);
             let mut chunk = [0; 64];
-            self.read_ep.read(&mut chunk).await.ok();
+            self.bulk.read_packet(&mut chunk).await.ok();
             for i in 0..chunk_len {
                 big_buf[(offset + i as u32) as usize] = chunk[i];
             }
@@ -137,12 +257,19 @@ where
             return;
         }
 
+        // OK to erase flash
+
+        // FIXME: FLASH // p reference is not available here
+        // let flash_app_addr = 0x8010000;
+        // let mut f = Flash::new_blocking(&self.p.FLASH);
+        // f.blocking_erase(flash_app_addr, flash_app_addr + total_firmware_len).unwrap();
+
         // read chunks of 64 bytes until we have read final_len bytes
         // offset should be 0x500 from the previous read
         while offset < total_firmware_len {
             let chunk_len = core::cmp::min(64, (total_firmware_len - offset) as usize);
             let mut chunk = [0; 64];
-            self.read_ep.read(&mut chunk).await.ok();
+            self.bulk.read_packet(&mut chunk).await.ok();
             // throw away the data for now
             // for i in 0..chunk_len {
             //     big_buf[(offset + i as u32) as usize] = chunk[i];
@@ -156,46 +283,13 @@ where
 
         // Send ACK
         debug!("Sending ACK after reading firmware");
-        self.write_ep.write(&[0x00]).await.ok();
+        self.bulk.write_packet(&[0x00]).await.ok();
 
         // delay 100ms
         Timer::after_millis(100).await;
 
         // Reboot
         cortex_m::peripheral::SCB::sys_reset();
-    }
-
-    async fn process_data(&mut self, data: &[u8]) {
-        // Following commands are supported by the original V9 bootloader:
-        // - cmd_01_version
-        // - cmd_04_get_info
-        // - cmd_05_set_speed
-        // - cmd_06_update_firmware
-        // - cmd_e6_read_config_bf00
-        // - cmd_ed_get_caps_ex
-        // - cmd_f0_get_hw_version
-        // - cmd_fe_read_emu_mem
-
-        let count = data.len();
-        if count == 1 {
-            match data[0] {
-                0x01 => {
-                    self.cmd_01_version().await;
-                }
-                0x04 => {
-                    self.cmd_04_get_info().await;
-                }
-                0x06 => {
-                    self.cmd_06_update_firmware().await;
-                }
-                _ => {
-                    warn!("Unknown command 0x{:02x}", data[0]);
-                    //self.write_ep.write(&[0xFF]).await.ok();
-                }
-            }
-        } else {
-            warn!("Got unknown data with len: {} bytes", count);
-        }
     }
 }
 
