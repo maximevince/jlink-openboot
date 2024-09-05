@@ -8,7 +8,6 @@ use defmt::{info, unwrap};
 use embassy_executor::Spawner;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::Config;
-use embassy_stm32::flash::{Blocking, Flash};
 use static_cell::StaticCell;
 use usb_jboot::JBoot;
 use {defmt_rtt as _, panic_probe as _};

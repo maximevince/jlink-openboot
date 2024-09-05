@@ -24,11 +24,7 @@ pub struct JBootInner<'a> {
     bulk: BulkClass<'a, Driver<'a, USB_OTG_FS>>,
     big_buf: &'static StaticCell<[u8; 0x500]>,
     // p: &'a embassy_stm32::Peripherals,
-    // flash: Flash<'a>,
-}
-
-pub struct HwContext<'a> {
-    pub flash: Flash<'a>,
+    flash: Flash<'a, Blocking>,
 }
 
 
@@ -84,14 +80,12 @@ impl<'a> JBoot<'a>
 
         // Build the builder.
         let usb = builder.build();
-        // let usb_fut = usb.run();
 
-        // Run the USB device.
-        // let usb_fut = usb.run();
+        let flash = Flash::new_blocking(p.FLASH);
 
         Self {
             usb,
-            inner: JBootInner { bulk, big_buf },
+            inner: JBootInner { bulk, big_buf, flash },
         }
     }
 
@@ -258,11 +252,13 @@ impl<'a> JBootInner<'a>
         }
 
         // OK to erase flash
+        // Offsets from the flash start, NOT an absolute address.
+        // For example, to erase address 0x0801_0000 you have to use offset 0x1_0000
+        let flash_app_addr = 0x8010000 - 0x8000000;
+        self.flash.blocking_erase(flash_app_addr, flash_app_addr + total_firmware_len).unwrap();
 
-        // FIXME: FLASH // p reference is not available here
-        // let flash_app_addr = 0x8010000;
-        // let mut f = Flash::new_blocking(&self.p.FLASH);
-        // f.blocking_erase(flash_app_addr, flash_app_addr + total_firmware_len).unwrap();
+        // Write the first 0x500 bytes to flash
+        self.flash.blocking_write(flash_app_addr, big_buf).unwrap();
 
         // read chunks of 64 bytes until we have read final_len bytes
         // offset should be 0x500 from the previous read
@@ -270,12 +266,9 @@ impl<'a> JBootInner<'a>
             let chunk_len = core::cmp::min(64, (total_firmware_len - offset) as usize);
             let mut chunk = [0; 64];
             self.bulk.read_packet(&mut chunk).await.ok();
-            // throw away the data for now
-            // for i in 0..chunk_len {
-            //     big_buf[(offset + i as u32) as usize] = chunk[i];
-            // }
 
-            // TODO: write the data to flash
+            // Write to flash
+            self.flash.blocking_write(flash_app_addr + offset, &chunk).unwrap();
 
             offset += chunk_len as u32;
             debug!("offset: 0x{:x}", offset);

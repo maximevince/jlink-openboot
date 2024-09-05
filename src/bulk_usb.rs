@@ -23,17 +23,20 @@ impl<'d, D: Driver<'d>> BulkClass<'d, D> {
     }
 
     /// Gets the maximum packet size in bytes.
+    #[allow(dead_code)]
     pub fn max_packet_size(&self) -> u16 {
         // The size is the same for both endpoints.
         self.read_ep.info().max_packet_size
     }
 
     /// Writes a single packet into the IN endpoint.
+    #[allow(dead_code)]
     pub async fn write_packet(&mut self, data: &[u8]) -> Result<(), EndpointError> {
         self.write_ep.write(data).await
     }
 
     // Writes data to the IN endpoint, splitting it into multiple packets if necessary.
+    #[allow(dead_code)]
     pub async fn write_split(&mut self, data: &[u8]) -> Result<(), EndpointError> {
         Ok(for chunk in data.chunks(self.max_packet_size() as usize) {
             self.write_packet(chunk).await?;
@@ -41,11 +44,13 @@ impl<'d, D: Driver<'d>> BulkClass<'d, D> {
     }
 
     /// Reads a single packet from the OUT endpoint.
+    #[allow(dead_code)]
     pub async fn read_packet(&mut self, data: &mut [u8]) -> Result<usize, EndpointError> {
         self.read_ep.read(data).await
     }
 
     /// Waits for the USB host to enable this interface
+    #[allow(dead_code)]
     pub async fn wait_connection(&mut self) {
         self.read_ep.wait_enabled().await;
     }
