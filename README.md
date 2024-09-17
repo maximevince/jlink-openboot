@@ -1,7 +1,7 @@
 # JLink Open Bootloader
 
 An open source bootloader for the JLink V9, written in Rust.  
-This project is a work in progress and is not yet functional.
+This project is a work in progress and is barely functional.
 
 ## Notes
 
@@ -76,15 +76,14 @@ Endpoints:
 
 ## Bootloader command list
 Following commands are supported by the original bootloader:
-1. cmd_01_version
+1. cmd_01_version [supported]
 1. cmd_04_get_info
 1. cmd_05_set_speed
-1. cmd_06_update_firmware
+1. cmd_06_update_firmware [supported]
 1. cmd_e6_read_config_bf00
 1. cmd_ed_get_caps_ex
 1. cmd_f0_get_hw_version
 1. cmd_fe_read_emu_mem
-
 
 
 
